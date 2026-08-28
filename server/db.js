@@ -18,12 +18,32 @@ try {
 } catch (e) {}
 
 try {
-  db.exec("ALTER TABLE votes ADD COLUMN voter_id TEXT;");
-} catch (e) {}
-
-try {
   db.exec("ALTER TABLE learners ADD COLUMN password_plain TEXT;");
 } catch (e) {}
+
+// Ballot secrecy migration.
+//
+// Earlier builds stamped votes.voter_id on every row, which defeated the
+// anonymous ballot_token design and let the admin dashboard reconstruct any
+// learner's ballot. Anonymise existing rows first, then remove the column so
+// nothing can repopulate it. NULL-ing runs first because it still protects the
+// data if DROP COLUMN is unavailable on an older SQLite.
+const votesHasVoterId = db
+  .prepare("SELECT COUNT(*) AS n FROM pragma_table_info('votes') WHERE name = 'voter_id'")
+  .get().n > 0;
+
+if (votesHasVoterId) {
+  const orphaned = db.prepare("SELECT COUNT(*) AS n FROM votes WHERE voter_id IS NOT NULL").get().n;
+  db.exec("UPDATE votes SET voter_id = NULL;");
+  try {
+    db.exec("ALTER TABLE votes DROP COLUMN voter_id;");
+    console.log(`[MIGRATION] Ballot secrecy: anonymised ${orphaned} vote(s), dropped votes.voter_id.`);
+  } catch (e) {
+    console.warn(
+      `[MIGRATION] Ballot secrecy: anonymised ${orphaned} vote(s); could not drop votes.voter_id (${e.message}). Column retained but left NULL.`
+    );
+  }
+}
 
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
@@ -78,6 +98,8 @@ db.exec(`
     FOREIGN KEY (election_code) REFERENCES elections(code)
   );
 
+  -- No voter_id here, deliberately. A vote row must never be traceable to a
+  -- learner; the only link is the random ballot_token, which is not exposed.
   CREATE TABLE IF NOT EXISTS votes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ballot_token TEXT NOT NULL,
@@ -85,7 +107,6 @@ db.exec(`
     position_id INTEGER NOT NULL,
     candidate_id INTEGER NOT NULL,
     submitted_at TEXT NOT NULL,
-    voter_id TEXT,
     FOREIGN KEY (election_code) REFERENCES elections(code),
     FOREIGN KEY (position_id) REFERENCES positions(id),
     FOREIGN KEY (candidate_id) REFERENCES candidates(id)

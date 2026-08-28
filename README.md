@@ -6,7 +6,7 @@ A React + Express + embedded SQLite election platform for M.A Brain Development 
 
 - Separate `/selg` and `/sslg` learner voting portals
 - Separate learner eligibility by division
-- One candidate required for every position
+- At most one candidate per position; a learner may abstain on any position
 - One ballot per learner per election
 - Final review before submission
 - Anonymous vote rows in SQLite
@@ -126,7 +126,9 @@ The `voter_participation` table stores:
 - receipt code
 - submission time
 
-The `votes` table stores candidate selections under a separate random anonymous ballot token.
+The `votes` table stores candidate selections under a separate random anonymous
+ballot token. It has **no `voter_id` column** — the link does not exist in the
+schema, so no query can reconstruct it.
 
 The administrator dashboard intentionally does **not** show which candidates a specific learner selected. It only shows:
 
@@ -134,6 +136,35 @@ The administrator dashboard intentionally does **not** show which candidates a s
 2. participation receipts.
 
 This helps avoid turning a receipt into proof of how somebody voted.
+
+`server/validate.mjs` asserts this directly: it submits a known ballot and fails
+if any chosen candidate's name appears in the admin API response.
+
+## Abstention
+
+A learner may leave any position blank. Skipped positions record **no vote** —
+nothing is auto-filled on their behalf. A ballot with no selections at all is
+rejected, and that rejection does not consume the learner's one-ballot allowance.
+
+## Validating election integrity
+
+```bash
+node server/validate.mjs
+```
+
+Runs the real server against a throwaway database (the live one is stashed and
+restored automatically) and asserts, among others:
+
+- an abstained position records zero votes
+- the first-listed candidate gains nothing from a skipped race
+- a candidate cannot receive a vote in a race they are not standing in
+- the admin API cannot retrieve any learner's selections
+- duplicate ballots are rejected
+- login endpoints are rate limited
+- production refuses to boot with the default `JWT_SECRET`
+
+`better-sqlite3` ships a platform-specific native binary, so run this on
+Linux/macOS or inside the Docker image.
 
 ## Before real election deployment
 

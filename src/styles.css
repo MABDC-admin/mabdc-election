@@ -7748,6 +7748,20 @@ h1, h2, h3, h4, h5, h6,
     display: none !important;
   }
 
+  .all-pdf-reports-wrap.mode-credential_slips .master-report-doc,
+  .all-pdf-reports-wrap.mode-credential_slips .voter-ledger-doc,
+  .all-pdf-reports-wrap.mode-credential_slips .unvoted-roll-doc {
+    display: none !important;
+  }
+
+  /* Credential slips are never part of any other report. */
+  .all-pdf-reports-wrap.mode-master .credential-slips-doc,
+  .all-pdf-reports-wrap.mode-voter_ledger .credential-slips-doc,
+  .all-pdf-reports-wrap.mode-unvoted_roll .credential-slips-doc,
+  .all-pdf-reports-wrap.mode-winners .credential-slips-doc {
+    display: none !important;
+  }
+
   .all-pdf-reports-wrap.mode-winners .winners-proclamation-card {
     display: block !important;
   }
@@ -9809,4 +9823,271 @@ h1, h2, h3, h4, h5, h6,
 .footer-sync-time {
   font-size: 12px;
   color: #94a3b8;
+}
+
+/* --- Ballot secrecy panel (admin voter record modal) ---
+   Replaces the former per-learner choice grid. Individual selections are not
+   retrievable; this panel reports participation status only. */
+.modal-secrecy-panel {
+  padding: 22px 24px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--paper-2);
+}
+
+.modal-secrecy-status {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.modal-secrecy-status .secrecy-icon {
+  font-size: 26px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.modal-secrecy-status strong {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+
+.modal-secrecy-status p {
+  margin: 0;
+  color: var(--muted);
+  font-size: .92rem;
+  line-height: 1.5;
+}
+
+.modal-secrecy-footnote {
+  margin: 16px 0 0;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+  color: var(--muted);
+  font-size: .82rem;
+  font-style: italic;
+}
+
+/* ==========================================================================
+   VOTER LOGIN SLIPS (printMode "credential_slips")
+   Cut-out slips carrying one learner's credentials each. Screen styles keep
+   the sheet legible in the admin preview; the print block below lays it out
+   3-up on A4 with clean page breaks.
+   ========================================================================== */
+.credential-slips-doc {
+  background: #ffffff;
+  color: #0f172a;
+}
+
+.slips-sheet-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-bottom: 10px;
+  border-bottom: 3px solid #b8860b;
+}
+
+.slips-header-logo {
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
+}
+
+.slips-sheet-header h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: 0.5px;
+}
+
+.slips-sheet-header p {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  color: #475569;
+}
+
+.slips-confidential-stamp {
+  margin-left: auto;
+  border: 2px solid #b13d3d;
+  color: #b13d3d;
+  font-weight: 900;
+  font-size: 10px;
+  letter-spacing: 1px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  transform: rotate(-4deg);
+}
+
+.slips-handling-note {
+  margin: 10px 0 14px;
+  font-size: 10px;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  border-radius: 5px;
+  padding: 7px 10px;
+}
+
+.credential-slips-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6mm;
+}
+
+.credential-slip {
+  border: 1px dashed #94a3b8;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.slip-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 5px;
+}
+
+.slip-logo {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+
+.slip-org strong {
+  display: block;
+  font-size: 8px;
+  letter-spacing: 0.3px;
+  line-height: 1.2;
+}
+
+.slip-org small {
+  font-size: 7px;
+  color: #64748b;
+}
+
+.slip-label {
+  display: block;
+  font-size: 6.5px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  color: #64748b;
+  text-transform: uppercase;
+}
+
+.slip-name {
+  display: block;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.slip-level {
+  font-size: 8px;
+  color: #475569;
+}
+
+.slip-creds {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  padding: 6px 7px;
+}
+
+.slip-value {
+  display: block;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  color: #0f172a;
+  word-break: break-all;
+}
+
+.slip-password {
+  font-size: 13px;
+  letter-spacing: 1.4px;
+}
+
+.slip-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 6.8px;
+  color: #64748b;
+  border-top: 1px dotted #cbd5e1;
+  padding-top: 5px;
+  margin-top: auto;
+}
+
+.slip-status {
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.badge-confidential {
+  background: #fee2e2 !important;
+  color: #991b1b !important;
+}
+
+@media print {
+  .credential-slips-doc {
+    padding: 6mm 8mm !important;
+  }
+
+  .credential-slips-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, 1fr) !important;
+    gap: 5mm !important;
+  }
+
+  /* Never split a learner's slip across two pages. */
+  .credential-slip {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    border: 1px dashed #94a3b8 !important;
+    background: #ffffff !important;
+  }
+
+  .slips-sheet-header,
+  .slips-handling-note {
+    break-after: avoid !important;
+    page-break-after: avoid !important;
+  }
+
+  .slip-password {
+    color: #0f172a !important;
+  }
+}
+
+/* Admin photo upload button (learner + candidate rows) */
+.row-photo-btn {
+  background: #eef2ff;
+  color: #3730a3;
+  border: 1px solid #c7d2fe;
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.row-photo-btn:hover:not(:disabled) {
+  background: #e0e7ff;
+  transform: translateY(-1px);
+}
+
+.row-photo-btn:disabled {
+  opacity: .6;
+  cursor: progress;
 }

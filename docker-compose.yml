@@ -1,0 +1,15 @@
+services:
+  election-app:
+    build: .
+    restart: always
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./server/data:/app/server/data
+      - ./public/photos:/app/public/photos
+    # Secrets are supplied at runtime, never baked into an image layer.
+    # .dockerignore excludes .env from the build context for the same reason.
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
