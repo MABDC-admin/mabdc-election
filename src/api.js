@@ -74,8 +74,14 @@ export const api = {
     });
   },
 
-  getLiveResults(code) {
-    return request(`/elections/${code}/live-results`);
+  getLiveResults(code, pinOverride) {
+    // The PIN is kept per-tab: a shared projector unlocks once, and closing the
+    // tab re-locks it. It is never written to localStorage or the URL.
+    let pin = pinOverride;
+    if (pin === undefined) {
+      try { pin = sessionStorage.getItem("mabdc_results_pin") || ""; } catch { pin = ""; }
+    }
+    return request(`/elections/${code}/live-results`, pin ? { headers: { "X-Results-Pin": pin } } : {});
   },
 
   uploadCandidatePhoto(token, candidateId, photoB64) {

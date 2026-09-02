@@ -863,7 +863,7 @@ function VoterBallotHistoryModal({ token, voterId, electionCode, onClose }) {
    OFFICIAL PRINT / PDF REPORT SUITE (4 COMPREHENSIVE PDF DOCUMENTS)
    ========================================================================== */
 
-function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
+function AllPdfReportsContainer({ dashboard, electionCode, printMode, slipGrade = "ALL" }) {
   if (!dashboard) return null;
   const stats = dashboard.stats || { totalEligible: 0, votesCast: 0, turnout: 0, remaining: 0 };
   const results = dashboard.results || [];
@@ -878,6 +878,16 @@ function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
       return acc;
     }, [])
     .sort((a, b) => (a.level || "").localeCompare(b.level || "") || (a.name || "").localeCompare(b.name || ""));
+
+  // Login slips are printed one grade at a time so each class can be handed its
+  // own stack. "ALL" keeps the whole division in a single run.
+  const gradeNumber = (level) => {
+    const m = String(level || "").match(/(\d+)/);
+    return m ? Number(m[1]) : null;
+  };
+  const slipLearners =
+    slipGrade === "ALL" ? allLearners : allLearners.filter((l) => gradeNumber(l.level) === Number(slipGrade));
+  const slipGradeLabel = slipGrade === "ALL" ? "All grades" : `Grade ${slipGrade}`;
 
   // Group candidates by partylist
   const partylistSummary = {};
@@ -1386,7 +1396,7 @@ function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
                   ? "Supreme Elementary Learner Government (SELG) • Grades 4–6"
                   : "Supreme Secondary Learner Government (SSLG) • Grades 7–12"}
                 {" • "}
-                {allLearners.length} learners • Generated {new Date().toLocaleString()}
+                {slipGradeLabel} • {slipLearners.length} learners • Generated {new Date().toLocaleString()}
               </p>
             </div>
             <div className="slips-confidential-stamp">CONFIDENTIAL</div>
@@ -1399,7 +1409,7 @@ function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
           </p>
 
           <div className="credential-slips-grid">
-            {allLearners.map((learner, idx) => (
+            {slipLearners.map((learner, idx) => (
               <div className="credential-slip" key={learner.voter_id || idx}>
                 <div className="slip-top">
                   <img src="/mabdc_logo.png" alt="" className="slip-logo" />
@@ -1444,9 +1454,21 @@ function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
 }
 
 function ExportReportModal({ dashboard, electionCode, onClose, onPrintPdf }) {
-  function handlePdfExport(mode) {
-    onPrintPdf(mode);
+  function handlePdfExport(mode, grade) {
+    onPrintPdf(mode, grade);
   }
+
+  // Grades actually present in this division, so SELG shows 4-6 and SSLG 7-12.
+  const slipRoster = [...(dashboard?.receipts || []), ...(dashboard?.unvotedLearners || [])].reduce((acc, l) => {
+    if (!acc.some((x) => x.voter_id === l.voter_id)) acc.push(l);
+    return acc;
+  }, []);
+  const gradeCounts = {};
+  for (const l of slipRoster) {
+    const m = String(l.level || "").match(/(\d+)/);
+    if (m) gradeCounts[Number(m[1])] = (gradeCounts[Number(m[1])] || 0) + 1;
+  }
+  const slipGrades = Object.keys(gradeCounts).map(Number).sort((a, b) => a - b);
 
   function downloadMasterCSV() {
     if (!dashboard) return;
@@ -1649,13 +1671,29 @@ function ExportReportModal({ dashboard, electionCode, onClose, onPrintPdf }) {
               <div className="report-card-info">
                 <h4>Voter Login Slips (.PDF)</h4>
                 <p>
-                  Cut-out slip for every registered learner ({dashboard?.stats?.totalEligible || 0} total)
-                  with their Voter ID and password, for handing out before voting.
+                  Cut-out slip per learner with their Voter ID and password, for handing
+                  out before voting. Pick a grade to print that class only.
                   Contains credentials — print, distribute, then destroy any spares.
                 </p>
               </div>
-              <button type="button" className="secondary-button full-width" onClick={() => handlePdfExport("credential_slips")}>
-                🖨️ Download Login Slips PDF
+              {/* One grade at a time: each class adviser gets their own stack,
+                  and a mislaid sheet exposes one class rather than the school. */}
+              <div className="slip-grade-row">
+                {slipGrades.map((g) => (
+                  <button
+                    key={g}
+                    type="button"
+                    className="slip-grade-btn"
+                    onClick={() => handlePdfExport("credential_slips", String(g))}
+                    title={`Print login slips for Grade ${g} only`}
+                  >
+                    G{g}
+                    <small>{gradeCounts[g] || 0}</small>
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="secondary-button full-width" onClick={() => handlePdfExport("credential_slips", "ALL")}>
+                🖨️ All grades in one PDF ({dashboard?.stats?.totalEligible || 0})
               </button>
             </div>
           </div>
@@ -1688,6 +1726,7 @@ export default function AdminPortal() {
   const [showReportModal, setShowReportModal] = useState(false);
   const [printMode, setPrintMode] = useState("master");
   const [photoBusyId, setPhotoBusyId] = useState(null);
+  const [slipGrade, setSlipGrade] = useState("ALL");
   // Uploaded photos keep the same filename, so a counter is appended to image
   // URLs to force the browser to fetch the replacement.
   const [photoVersion, setPhotoVersion] = useState(0);
@@ -2229,6 +2268,7 @@ export default function AdminPortal() {
           dashboard={dashboard}
           electionCode={electionCode}
           printMode={printMode}
+          slipGrade={slipGrade}
         />
       )}
 
@@ -2237,8 +2277,9 @@ export default function AdminPortal() {
           dashboard={dashboard}
           electionCode={electionCode}
           onClose={() => setShowReportModal(false)}
-          onPrintPdf={(mode) => {
+          onPrintPdf={(mode, grade = "ALL") => {
             setPrintMode(mode);
+            setSlipGrade(grade);
             setTimeout(() => {
               window.print();
             }, 150);

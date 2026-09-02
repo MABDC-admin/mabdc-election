@@ -10091,3 +10091,39 @@ h1, h2, h3, h4, h5, h6,
   opacity: .6;
   cursor: progress;
 }
+
+/* Per-grade login slip buttons */
+.slip-grade-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.slip-grade-btn {
+  flex: 1 1 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 4px;
+  border: 1px solid #fca5a5;
+  border-radius: 6px;
+  background: #fef2f2;
+  color: #991b1b;
+  font-weight: 800;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+
+.slip-grade-btn small {
+  font-size: 9px;
+  font-weight: 600;
+  opacity: .75;
+}
+
+.slip-grade-btn:hover {
+  background: #fee2e2;
+  transform: translateY(-1px);
+}

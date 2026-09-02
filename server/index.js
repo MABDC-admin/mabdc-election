@@ -154,6 +154,36 @@ const adminLoginLimiter = RATE_LIMITS_ENABLED
     })
   : passThrough;
 
+/**
+ * Gate for the public results feed.
+ *
+ * Live tallies visible mid-election let an undecided voter see the standings
+ * before choosing, so the results endpoint can be locked behind a short PIN
+ * shared with staff. Unset RESULTS_PIN keeps results public, which is the
+ * previous behaviour.
+ */
+const RESULTS_PIN = String(process.env.RESULTS_PIN || "").trim();
+
+function requireResultsPin(req, res, next) {
+  if (!RESULTS_PIN) return next();
+
+  const supplied = String(req.headers["x-results-pin"] || req.query.pin || "").trim();
+  if (supplied && safeEqual(supplied, RESULTS_PIN)) return next();
+
+  // An administrator session is already privileged enough to see the tally.
+  const token = readBearer(req);
+  if (token) {
+    try {
+      if (jwt.verify(token, JWT_SECRET).role === "admin") return next();
+    } catch {}
+  }
+
+  return res.status(401).json({
+    error: "Results are locked. Enter the results PIN to view the tally.",
+    pinRequired: true
+  });
+}
+
 /** Constant-time string comparison so credentials cannot be recovered by timing. */
 function safeEqual(a, b) {
   const bufA = Buffer.from(String(a));
@@ -339,7 +369,7 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.get("/api/elections/:code/live-results", (req, res) => {
+app.get("/api/elections/:code/live-results", requireResultsPin, (req, res) => {
   const electionCode = normalizeElection(req.params.code);
   if (!electionCode) {
     return res.status(400).json({ error: "Choose SELG or SSLG." });

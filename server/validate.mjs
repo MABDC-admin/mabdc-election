@@ -506,6 +506,49 @@ server.stderr.on("data", (d) => (serverLog += d));
   const unauth = await post(`/api/admin/candidates/${alice}/photo`, { photo_b64: TINY_JPEG });
   check("photo upload requires an admin token", unauth.status === 401, `status ${unauth.status}`);
 
+  // --- Results PIN --------------------------------------------------------
+  console.log("Results gate");
+  console.log("------------");
+
+  // The suite boots the server without RESULTS_PIN, so results stay public.
+  const openResults = await get("/api/elections/SSLG/live-results");
+  check("results are public when no PIN is configured", openResults.status === 200, `status ${openResults.status}`);
+
+  const gated = spawn(process.execPath, [path.join(__dirname, "index.js")], {
+    cwd: projectRoot,
+    env: { ...process.env, PORT: "4096", NODE_ENV: "test", JWT_SECRET, ADMIN_USERNAME: "admin", ADMIN_PASSWORD: "test-admin-password", RESULTS_PIN: "7391" },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const GATED = "http://127.0.0.1:4096";
+  for (let i = 0; i < 60; i += 1) {
+    try { if ((await fetch(`${GATED}/api/health`)).ok) break; } catch {}
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  const noPin = await fetch(`${GATED}/api/elections/SSLG/live-results`);
+  check("results refused without the PIN", noPin.status === 401, `status ${noPin.status}`);
+  const noPinBody = await noPin.json().catch(() => ({}));
+  check("refusal tells the client a PIN is needed", noPinBody.pinRequired === true);
+
+  const wrongPin = await fetch(`${GATED}/api/elections/SSLG/live-results`, { headers: { "X-Results-Pin": "0000" } });
+  check("wrong PIN refused", wrongPin.status === 401, `status ${wrongPin.status}`);
+
+  const rightPin = await fetch(`${GATED}/api/elections/SSLG/live-results`, { headers: { "X-Results-Pin": "7391" } });
+  check("correct PIN grants access", rightPin.status === 200, `status ${rightPin.status}`);
+
+  // Voting must never be affected by the results gate.
+  const ballotStillOpen = await fetch(`${GATED}/api/elections/SSLG/ballot`);
+  check("voting ballot stays public while results are locked", ballotStillOpen.status === 200, `status ${ballotStillOpen.status}`);
+
+  const adminTok = await (await fetch(`${GATED}/api/admin/login`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "test-admin-password" })
+  })).json().catch(() => ({}));
+  const viaAdmin = await fetch(`${GATED}/api/elections/SSLG/live-results`, { headers: { Authorization: `Bearer ${adminTok.token}` } });
+  check("admin token also grants access", viaAdmin.status === 200, `status ${viaAdmin.status}`);
+
+  gated.kill();
+
   const health = await get("/api/health");
   check(
     "health endpoint does not leak the database path",
