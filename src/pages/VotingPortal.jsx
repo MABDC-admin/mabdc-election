@@ -96,8 +96,8 @@ function PortalLogin({ electionCode, onLogin }) {
               : "Secondary Learner Voting Booth"}
           </h1>
           <p>
-            One learner. One ballot. One choice for every position.
-            Review all selections before final submission.
+            One learner. One ballot. At most one choice per position — you may
+            leave a position blank. Review all selections before final submission.
           </p>
 
           <div className="chalk-rules">
@@ -355,19 +355,35 @@ export default function VotingPortal({ electionCode }) {
       } catch(e) {}
     }
 
-    const payloadSelections = (currentPositions || []).map((position) => {
-      const chosen = selections[position.id] || selections[position.title];
-      const chosenId = typeof chosen === "object" ? chosen?.candidateId : chosen;
-      const chosenName = typeof chosen === "object" ? chosen?.candidateName : "";
-      const cand = position.candidates?.find((c) => c.id === Number(chosenId) || (chosenName && c.name === chosenName)) || position.candidates?.[0];
+    // Only positions the learner actually chose are sent. Skipped positions are
+    // omitted entirely so the ballot records an abstention rather than a vote
+    // the learner never cast.
+    const payloadSelections = (currentPositions || [])
+      .map((position) => {
+        const chosen = selections[position.id] || selections[position.title];
+        if (!chosen) return null;
 
-      return {
-        positionId: position.id,
-        positionTitle: position.title,
-        candidateId: cand ? cand.id : (position.candidates?.[0]?.id || 1),
-        candidateName: cand ? cand.name : (position.candidates?.[0]?.name || "")
-      };
-    });
+        const chosenId = typeof chosen === "object" ? chosen?.candidateId : chosen;
+        const chosenName = typeof chosen === "object" ? chosen?.candidateName : "";
+        const cand = position.candidates?.find(
+          (c) => c.id === Number(chosenId) || (chosenName && c.name === chosenName)
+        );
+        if (!cand) return null;
+
+        return {
+          positionId: position.id,
+          positionTitle: position.title,
+          candidateId: cand.id,
+          candidateName: cand.name
+        };
+      })
+      .filter(Boolean);
+
+    if (payloadSelections.length === 0) {
+      setSubmitError("Choose at least one candidate before submitting your ballot.");
+      setSubmitting(false);
+      return;
+    }
 
     try {
       const result = await api.submitVote(session.token, {

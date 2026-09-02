@@ -17,9 +17,180 @@ const PORT = Number(process.env.PORT || 4000);
 const JWT_SECRET = process.env.JWT_SECRET || "development-only-change-me";
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "MABDC@2026";
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
-app.use(cors());
+// Caddy terminates TLS and proxies to this server, so without this every
+// request would carry the proxy's IP and the per-IP rate limits below would be
+// shared by the whole school. One hop only: Caddy is the sole trusted proxy.
+app.set("trust proxy", 1);
+
+// Refuse to run a real election on forgeable tokens. With the fallback secret
+// anyone can mint an admin JWT, so this is a hard stop rather than a warning.
+if (IS_PRODUCTION && JWT_SECRET === "development-only-change-me") {
+  console.error(
+    "FATAL: JWT_SECRET is unset in production. Set a long random JWT_SECRET in .env before serving an election."
+  );
+  process.exit(1);
+}
+
+// The fallback admin password is published in this repository's .env.example,
+// so running with it in production would leave the dashboard open to anyone who
+// has read the source.
+if (IS_PRODUCTION && ADMIN_PASSWORD === "MABDC@2026") {
+  console.error(
+    "FATAL: ADMIN_PASSWORD is still the documented default. Set a unique ADMIN_PASSWORD in .env before serving an election."
+  );
+  process.exit(1);
+}
+
+// Browsers only need to call this API from the pages this server itself serves,
+// so same-origin requests (no Origin header) and an explicit allowlist are
+// enough. A wide-open CORS policy would let any site drive an authenticated
+// learner's session.
+const allowedOrigins = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true); // same-origin / curl / server-to-server
+      if (!IS_PRODUCTION) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      callback(new Error("Origin not allowed by CORS policy."));
+    }
+  })
+);
 app.use(express.json({ limit: "1mb" }));
+
+/**
+ * Fixed-window rate limiter, in-process and dependency-free.
+ *
+ * Both login routes accept short credentials (learner passcodes especially), so
+ * without a limit they are trivially brute-forceable over a school network.
+ * Counters live in memory: a restart clears them, which is acceptable here
+ * because the server is a single long-running process.
+ */
+function rateLimit({ windowMs, max, message, keyGenerator }) {
+  const hits = new Map(); // key -> { count, resetAt }
+
+  // Drop expired counters periodically so the map cannot grow unbounded over a
+  // long election day. unref() keeps the timer from holding the process open.
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of hits) {
+      if (now > entry.resetAt) hits.delete(key);
+    }
+  }, windowMs);
+  sweep.unref();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = keyGenerator ? keyGenerator(req) : req.ip || req.socket.remoteAddress || "unknown";
+    const entry = hits.get(key);
+
+    if (entry && now <= entry.resetAt && entry.count >= max) {
+      const retryAfter = Math.ceil((entry.resetAt - now) / 1000);
+      res.set("Retry-After", String(retryAfter));
+      return res.status(429).json({ error: message, retryAfterSeconds: retryAfter });
+    }
+
+    // Only *failed* attempts count against the budget, and a success clears it.
+    // Counting successes would punish normal use: a learner signing in, or an
+    // administrator who mistyped once and then got it right.
+    res.on("finish", () => {
+      const succeeded = res.statusCode < 400;
+      if (succeeded) {
+        hits.delete(key);
+        return;
+      }
+      const current = hits.get(key);
+      if (!current || Date.now() > current.resetAt) {
+        hits.set(key, { count: 1, resetAt: Date.now() + windowMs });
+      } else {
+        current.count += 1;
+      }
+    });
+
+    next();
+  };
+}
+
+// This runs a supervised, single-day school election, so the limits below are
+// deliberately loose: they exist to stop an automated password grind, not to
+// police people in the room. A learner or teacher who keeps mistyping should
+// never be locked out. Tune without rebuilding via the env vars, or set
+// RATE_LIMITS_ENABLED=false to switch them off entirely for election day.
+const RATE_LIMITS_ENABLED = String(process.env.RATE_LIMITS_ENABLED || "true") !== "false";
+const VOTER_LOGIN_MAX = Number(process.env.VOTER_LOGIN_MAX || 40);
+const ADMIN_LOGIN_MAX = Number(process.env.ADMIN_LOGIN_MAX || 60);
+
+const passThrough = (_req, _res, next) => next();
+
+// Keyed on the learner account being targeted, NOT the client IP. Every learner
+// on the school network shares one public IP, so an IP-keyed limit would lock
+// out the whole school partway through election day. Per-account still stops
+// someone grinding through passwords for a specific learner.
+const voterLoginLimiter = RATE_LIMITS_ENABLED
+  ? rateLimit({
+      windowMs: 10 * 60 * 1000,
+      max: VOTER_LOGIN_MAX,
+      keyGenerator: (req) => {
+        const voterId = String(req.body?.voterId || "").trim().toLowerCase();
+        return voterId ? `voter:${voterId}` : `ip:${req.ip || "unknown"}`;
+      },
+      message: "Too many failed sign-in attempts for this Voter ID. Please see your teacher."
+    })
+  : passThrough;
+
+// There is only one administrator account, so IP keying is right here: it is the
+// attacker's address we want to slow down.
+const adminLoginLimiter = RATE_LIMITS_ENABLED
+  ? rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: ADMIN_LOGIN_MAX,
+      message: "Too many failed administrator sign-in attempts. Please wait before trying again."
+    })
+  : passThrough;
+
+/**
+ * Gate for the public results feed.
+ *
+ * Live tallies visible mid-election let an undecided voter see the standings
+ * before choosing, so the results endpoint can be locked behind a short PIN
+ * shared with staff. Unset RESULTS_PIN keeps results public, which is the
+ * previous behaviour.
+ */
+const RESULTS_PIN = String(process.env.RESULTS_PIN || "").trim();
+
+function requireResultsPin(req, res, next) {
+  if (!RESULTS_PIN) return next();
+
+  const supplied = String(req.headers["x-results-pin"] || req.query.pin || "").trim();
+  if (supplied && safeEqual(supplied, RESULTS_PIN)) return next();
+
+  // An administrator session is already privileged enough to see the tally.
+  const token = readBearer(req);
+  if (token) {
+    try {
+      if (jwt.verify(token, JWT_SECRET).role === "admin") return next();
+    } catch {}
+  }
+
+  return res.status(401).json({
+    error: "Results are locked. Enter the results PIN to view the tally.",
+    pinRequired: true
+  });
+}
+
+/** Constant-time string comparison so credentials cannot be recovered by timing. */
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 function signToken(payload, expiresIn = "8h") {
   return jwt.sign(payload, JWT_SECRET, { expiresIn });
@@ -95,15 +266,110 @@ app.use("/api/photos", express.static(photosDir));
 app.use("/photos", express.static(photosDir));
 app.use("/election/photos", express.static(photosDir));
 
+// A photo_url pointing at a file that is no longer on disk would otherwise fall
+// through to a 404 and render as a broken image on the ballot. Serve a generated
+// avatar instead, seeded from the requested filename so it stays stable.
+const photoFallback = (req, res) => {
+  const seed = encodeURIComponent(path.basename(req.path).replace(/\.(jpg|jpeg|png|webp)$/i, "") || "photo");
+  res.redirect(
+    `https://api.dicebear.com/9.x/notionists/svg?seed=${seed}&backgroundColor=dae8df,e9dcbf,c8d8e8`
+  );
+};
+
+app.get("/api/photos/*splat", photoFallback);
+app.get("/photos/*splat", photoFallback);
+app.get("/election/photos/*splat", photoFallback);
+
+// --- Admin photo upload helpers ---------------------------------------------
+
+const PHOTO_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Confirms the decoded bytes really are the image type they claim to be.
+ * Checking only the "data:image/..." prefix would let any payload through
+ * under an image's name.
+ */
+function sniffImageType(buffer) {
+  if (buffer.length > 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "jpg";
+  if (
+    buffer.length > 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+    buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
+  ) return "png";
+  return null;
+}
+
+/**
+ * Writes an uploaded data URI to the photos directory under a caller-built
+ * basename. The basename is never taken from request input directly - callers
+ * derive it from an already-validated id - and the resolved path is checked to
+ * be inside photosDir so a crafted name cannot escape it.
+ */
+function savePhoto(dataUri, basename) {
+  const match = /^data:image\/(png|jpe?g);base64,([A-Za-z0-9+/=\s]+)$/.exec(String(dataUri || ""));
+  if (!match) return { error: "Unsupported image format. Send a PNG or JPEG data URI." };
+
+  let buffer;
+  try {
+    buffer = Buffer.from(match[2], "base64");
+  } catch {
+    return { error: "Photo data could not be decoded." };
+  }
+
+  if (!buffer.length) return { error: "Photo is empty." };
+  if (buffer.length > PHOTO_MAX_BYTES) {
+    return { error: `Photo is too large (${Math.round(buffer.length / 1024)}KB). Maximum is 4MB.` };
+  }
+
+  const kind = sniffImageType(buffer);
+  if (!kind) return { error: "That file is not a valid PNG or JPEG image." };
+
+  if (!fs.existsSync(photosDir)) fs.mkdirSync(photosDir, { recursive: true });
+
+  const filename = `${basename}.${kind}`;
+  const target = path.resolve(photosDir, filename);
+  if (path.dirname(target) !== path.resolve(photosDir)) {
+    return { error: "Invalid photo target." };
+  }
+
+  // Remove the other extension so a learner cannot end up with both a .jpg and
+  // a .png, where the lookup would pick whichever readdir happens to return.
+  for (const ext of ["jpg", "png"]) {
+    if (ext === kind) continue;
+    const stale = path.resolve(photosDir, `${basename}.${ext}`);
+    if (path.dirname(stale) === path.resolve(photosDir) && fs.existsSync(stale)) fs.unlinkSync(stale);
+  }
+
+  fs.writeFileSync(target, buffer);
+  return { filename, bytes: buffer.length };
+}
+
+/** Deletes every stored photo for a basename. Returns how many were removed. */
+function deletePhoto(basename) {
+  let removed = 0;
+  for (const ext of ["jpg", "png"]) {
+    const target = path.resolve(photosDir, `${basename}.${ext}`);
+    if (path.dirname(target) !== path.resolve(photosDir)) continue;
+    if (fs.existsSync(target)) {
+      fs.unlinkSync(target);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+const photoBody = express.json({ limit: "6mb" });
+
+// Public endpoint: reports liveness only. The database path is a filesystem
+// detail and is not exposed here.
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    database: "SQLite",
-    databaseFile: dbPathForDisplay
+    database: "SQLite"
   });
 });
 
-app.get("/api/elections/:code/live-results", (req, res) => {
+app.get("/api/elections/:code/live-results", requireResultsPin, (req, res) => {
   const electionCode = normalizeElection(req.params.code);
   if (!electionCode) {
     return res.status(400).json({ error: "Choose SELG or SSLG." });
@@ -180,7 +446,7 @@ app.get("/api/elections/:code/ballot" , (req, res) => {
   res.json(ballot);
 });
 
-app.post("/api/auth/voter", (req, res) => {
+app.post("/api/auth/voter", voterLoginLimiter, (req, res) => {
   const body = req.body || {};
   const electionCode = normalizeElection(body.electionCode);
   const rawVoterId = String(body.voterId || "").trim();
@@ -243,6 +509,21 @@ app.post("/api/auth/voter", (req, res) => {
 });
 
 app.post("/api/votes/submit", requireRole("voter"), (req, res) => {
+  // A request that carried bytes but produced no parsed body means the client
+  // omitted Content-Type (or sent something express.json() ignored). Treating
+  // that as "no selections" is how a client-side header bug turned into ballots
+  // full of default choices, so reject it loudly instead.
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  const parsedKeys = req.body && typeof req.body === "object" ? Object.keys(req.body).length : 0;
+  if (declaredLength > 0 && parsedKeys === 0) {
+    console.error(
+      `[VOTE SUBMIT] unreadable body from ${req.user?.voterId} — content-type: ${req.headers["content-type"] || "(none)"}`
+    );
+    return res.status(400).json({
+      error: "Your ballot could not be read by the server. Please refresh the page and try again."
+    });
+  }
+
   const body = req.body || {};
   const electionCode = normalizeElection(body.electionCode || req.user.electionCode || req.user.division);
 
@@ -289,51 +570,44 @@ app.post("/api/votes/submit", requireRole("voter"), (req, res) => {
 
   const selectionMap = new Map(); // position_id -> candidate_id
 
-  // 1. Process selections with exact 3-tier matching
+  // Resolve each selection strictly within the position it names.
+  //
+  // A candidate is only ever accepted for the race it actually belongs to. The
+  // previous build fell back to matching by name or id across the whole
+  // election, which let a malformed payload cast a vote in a race the learner
+  // never saw. Anything that does not resolve is dropped, not guessed.
   for (const sel of rawSelections) {
     if (!sel) continue;
-    const candId = Number(sel.candidateId || sel.id);
+
+    const candId = Number(sel.candidateId ?? sel.id);
     const candName = String(sel.candidateName || sel.name || "").trim().toLowerCase();
-    const posId = Number(sel.positionId || sel.posId);
+    const posId = Number(sel.positionId ?? sel.posId);
     const posTitle = String(sel.positionTitle || sel.title || "").trim().toLowerCase();
 
-    // Priority 1: Match within specific position
-    let targetPosId = posId;
-    if (!targetPosId && posTitle) {
-      const posObj = positions.find(p => p.title.trim().toLowerCase() === posTitle);
-      if (posObj) targetPosId = posObj.id;
+    let position = positions.find((p) => p.id === posId);
+    if (!position && posTitle) {
+      position = positions.find((p) => p.title.trim().toLowerCase() === posTitle);
     }
+    if (!position) continue;
 
-    let cand = null;
-    if (targetPosId) {
-      const posCands = allCandidates.filter(c => c.position_id === targetPosId);
-      cand = posCands.find(c => c.id === candId) ||
-             posCands.find(c => candName && c.name.trim().toLowerCase() === candName);
-    }
+    const positionCandidates = allCandidates.filter((c) => c.position_id === position.id);
+    const candidate =
+      positionCandidates.find((c) => c.id === candId) ||
+      (candName ? positionCandidates.find((c) => c.name.trim().toLowerCase() === candName) : null);
 
-    // Priority 2: Match by exact candidate name
-    if (!cand && candName) {
-      cand = allCandidates.find(c => c.name.trim().toLowerCase() === candName);
-    }
-
-    // Priority 3: Match by candidate ID
-    if (!cand && candId) {
-      cand = allCandidates.find(c => c.id === candId);
-    }
-
-    if (cand) {
-      selectionMap.set(cand.position_id, cand.id);
+    if (candidate) {
+      selectionMap.set(position.id, candidate.id);
     }
   }
 
-  // 2. Guaranteed Fail-safe for any untouched positions
-  for (const pos of positions) {
-    if (!selectionMap.has(pos.id)) {
-      const posCands = allCandidates.filter(c => c.position_id === pos.id);
-      if (posCands.length > 0) {
-        selectionMap.set(pos.id, posCands[0].id);
-      }
-    }
+  // Abstention is valid: a position the learner did not choose records no vote.
+  // Nothing is auto-filled. A ballot with no choices at all is rejected so an
+  // empty submission cannot silently consume the learner's one-ballot-per-
+  // election allowance.
+  if (selectionMap.size === 0) {
+    return res.status(400).json({
+      error: "Your ballot is empty. Choose at least one candidate before submitting."
+    });
   }
 
   const submitBallot = db.transaction(() => {
@@ -354,10 +628,12 @@ app.post("/api/votes/submit", requireRole("voter"), (req, res) => {
     const receiptCode = makeReceiptCode(electionCode);
     const anonymousBallotToken = crypto.randomUUID();
 
+    // voter_id is deliberately absent: the ballot is linked only to the random
+    // anonymousBallotToken, so no stored row ties a learner to their choices.
     const insertVote = db.prepare(`
       INSERT INTO votes
-      (ballot_token, election_code, position_id, candidate_id, submitted_at, voter_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      (ballot_token, election_code, position_id, candidate_id, submitted_at)
+      VALUES (?, ?, ?, ?, ?)
     `);
 
     for (const position of positions) {
@@ -368,8 +644,7 @@ app.post("/api/votes/submit", requireRole("voter"), (req, res) => {
           electionCode,
           position.id,
           Number(chosenCandId),
-          submittedAt,
-          String(req.user.voterId)
+          submittedAt
         );
       }
     }
@@ -439,57 +714,15 @@ app.get("/api/admin/voter/:voterId/ballot", requireRole("admin"), (req, res) => 
         ...learner,
         photoUrl: `/api/photos/election_photo.php?id=${learner.original_id || learner.voter_id}`
       },
-      hasVoted: false,
-      ballot: []
+      hasVoted: false
     });
   }
 
-  let votes = [];
-  if (participation.ballot_token) {
-    votes = db
-      .prepare(`
-        SELECT 
-          p.id AS position_id,
-          p.title AS position_title,
-          p.sort_order,
-          c.id AS candidate_id,
-          c.name AS candidate_name,
-          c.party AS candidate_party,
-          c.motto AS candidate_motto,
-          c.photo_url AS candidate_photo
-        FROM votes v
-        JOIN positions p ON p.id = v.position_id
-        JOIN candidates c ON c.id = v.candidate_id
-        WHERE v.ballot_token = ? AND v.election_code = ?
-        ORDER BY p.sort_order ASC
-      `)
-      .all(participation.ballot_token, electionCode);
-  }
-
-  // Fallback: Query by voter_id if token query returns empty
-  if (votes.length === 0) {
-    try {
-      votes = db
-        .prepare(`
-          SELECT 
-            p.id AS position_id,
-            p.title AS position_title,
-            p.sort_order,
-            c.id AS candidate_id,
-            c.name AS candidate_name,
-            c.party AS candidate_party,
-            c.motto AS candidate_motto,
-            c.photo_url AS candidate_photo
-          FROM votes v
-          JOIN positions p ON p.id = v.position_id
-          JOIN candidates c ON c.id = v.candidate_id
-          WHERE v.voter_id = ? AND v.election_code = ?
-          ORDER BY p.sort_order ASC
-        `)
-        .all(voterId, electionCode);
-    } catch(e) {}
-  }
-
+  // Ballot secrecy: this endpoint confirms *that* a learner voted and returns
+  // their participation receipt. It deliberately does not return which
+  // candidates they chose. Reconstructing an individual ballot would turn the
+  // receipt into proof of how somebody voted, which is exactly what the
+  // anonymous ballot_token exists to prevent.
   res.json({
     learner: {
       ...learner,
@@ -500,7 +733,8 @@ app.get("/api/admin/voter/:voterId/ballot", requireRole("admin"), (req, res) => 
       receipt_code: participation.receipt_code,
       submitted_at: participation.submitted_at
     },
-    ballot: votes
+    secrecyNotice:
+      "Individual candidate selections are not retrievable. Only aggregated results are available."
   });
 });
 
@@ -521,13 +755,11 @@ app.post("/api/admin/voter/:voterId/reset", requireRole("admin"), (req, res) => 
     return res.status(404).json({ error: "No participation record found for this learner." });
   }
 
-  // Delete from votes by ballot_token and voter_id
+  // The ballot_token is the only link from a participation record to its vote
+  // rows, so it is the only way to withdraw the cast ballot.
   if (participation.ballot_token) {
     db.prepare("DELETE FROM votes WHERE ballot_token = ? AND election_code = ?").run(participation.ballot_token, electionCode);
   }
-  try {
-    db.prepare("DELETE FROM votes WHERE LOWER(voter_id) = LOWER(?) AND election_code = ?").run(voterId, electionCode);
-  } catch (e) {}
 
   // Delete from voter_participation
   db.prepare("DELETE FROM voter_participation WHERE LOWER(voter_id) = LOWER(?) AND election_code = ?").run(voterId, electionCode);
@@ -540,11 +772,16 @@ app.post("/api/admin/voter/:voterId/reset", requireRole("admin"), (req, res) => 
   });
 });
 
-app.post("/api/admin/login", (req, res) => {
+app.post("/api/admin/login", adminLoginLimiter, (req, res) => {
   const username = String(req.body.username || "");
   const password = String(req.body.password || "");
 
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+  // Both comparisons always run so a wrong username and a wrong password take
+  // the same time and neither can be probed independently.
+  const usernameOk = safeEqual(username, ADMIN_USERNAME);
+  const passwordOk = safeEqual(password, ADMIN_PASSWORD);
+
+  if (!usernameOk || !passwordOk) {
     return res.status(401).json({ error: "Invalid administrator credentials." });
   }
 
@@ -553,39 +790,63 @@ app.post("/api/admin/login", (req, res) => {
     admin: { username }
   });
 });
-app.use("/election/photos", express.static(path.join(__dirname, "../public/photos")));
-app.use("/photos", express.static(path.join(__dirname, "../public/photos")));
-
-app.post("/api/admin/candidates/:id/photo", express.json({ limit: "5mb" }), requireRole("admin"), (req, res) => {
-  try {
-    const candidateId = req.params.id;
-    const { photo_b64 } = req.body;
-    if (!photo_b64 || !photo_b64.startsWith("data:image/")) {
-      return res.status(400).json({ error: "Invalid photo format. Must be base64 data URI." });
-    }
-
-    const match = photo_b64.match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/);
-    if (!match) return res.status(400).json({ error: "Unsupported image format." });
-    
-    const ext = match[1] === "jpeg" ? "jpg" : match[1];
-    const base64Data = match[2];
-    
-    const photosDir = path.join(__dirname, "../public/photos");
-    if (!fs.existsSync(photosDir)) fs.mkdirSync(photosDir, { recursive: true });
-    
-    const filename = `cand_${candidateId}_${Date.now()}.${ext}`;
-    const filePath = path.join(photosDir, filename);
-    const photoUrl = `/election/photos/${filename}`;
-    
-    fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-    
-    db.prepare("UPDATE candidates SET photo_url = ? WHERE id = ?").run(photoUrl, candidateId);
-    
-    res.json({ success: true, photo_url: photoUrl });
-  } catch (err) {
-    console.error("Photo upload error:", err);
-    res.status(500).json({ error: "Failed to upload photo." });
+app.post("/api/admin/candidates/:id/photo", photoBody, requireRole("admin"), (req, res) => {
+  // Digits only: the id becomes part of a filename, so anything else is refused
+  // rather than sanitised.
+  const candidateId = String(req.params.id || "");
+  if (!/^\d+$/.test(candidateId)) {
+    return res.status(400).json({ error: "Invalid candidate id." });
   }
+
+  const candidate = db.prepare("SELECT id FROM candidates WHERE id = ?").get(candidateId);
+  if (!candidate) return res.status(404).json({ error: "Candidate not found." });
+
+  const result = savePhoto(req.body?.photo_b64, `cand_${candidateId}`);
+  if (result.error) return res.status(400).json({ error: result.error });
+
+  const photoUrl = `/election/photos/${result.filename}`;
+  db.prepare("UPDATE candidates SET photo_url = ? WHERE id = ?").run(photoUrl, candidateId);
+
+  console.log(`[PHOTO] candidate ${candidateId} updated (${Math.round(result.bytes / 1024)}KB)`);
+  res.json({ success: true, photo_url: photoUrl });
+});
+
+app.delete("/api/admin/candidates/:id/photo", requireRole("admin"), (req, res) => {
+  const candidateId = String(req.params.id || "");
+  if (!/^\d+$/.test(candidateId)) return res.status(400).json({ error: "Invalid candidate id." });
+
+  const removed = deletePhoto(`cand_${candidateId}`);
+  db.prepare("UPDATE candidates SET photo_url = NULL WHERE id = ?").run(candidateId);
+  res.json({ success: true, removed });
+});
+
+app.post("/api/admin/learners/:voterId/photo", photoBody, requireRole("admin"), (req, res) => {
+  const voterId = String(req.params.voterId || "");
+  if (!/^\d+$/.test(voterId)) {
+    return res.status(400).json({ error: "Invalid voter ID." });
+  }
+
+  const learner = db.prepare("SELECT voter_id, name FROM learners WHERE voter_id = ?").get(voterId);
+  if (!learner) return res.status(404).json({ error: "Learner not found." });
+
+  // Stored as <LRN>.jpg so the existing photo lookup finds it with no extra
+  // wiring, exactly like the photos imported from the ID photo folders.
+  const result = savePhoto(req.body?.photo_b64, voterId);
+  if (result.error) return res.status(400).json({ error: result.error });
+
+  console.log(`[PHOTO] learner ${voterId} updated (${Math.round(result.bytes / 1024)}KB)`);
+  res.json({
+    success: true,
+    photo_url: `/api/photos/election_photo.php?voterId=${encodeURIComponent(voterId)}&v=${Date.now()}`
+  });
+});
+
+app.delete("/api/admin/learners/:voterId/photo", requireRole("admin"), (req, res) => {
+  const voterId = String(req.params.voterId || "");
+  if (!/^\d+$/.test(voterId)) return res.status(400).json({ error: "Invalid voter ID." });
+
+  const removed = deletePhoto(voterId);
+  res.json({ success: true, removed });
 });
 
 app.get("/api/admin/dashboard", requireRole("admin"), (req, res) => {
@@ -692,18 +953,25 @@ if (fs.existsSync(distPath)) {
   app.use("/election/assets", express.static(path.join(distPath, "assets")));
   app.use("/assets", express.static(path.join(distPath, "assets")));
   app.use("/election", express.static(distPath));
-  app.use(express.static(path.join(__dirname, '../public')));
-app.use(express.static(distPath));
+  // index: false on the unprefixed mounts so express.static does not answer "/"
+  // with a blank-rendering index.html before the redirect below can run. Hashed
+  // asset files are still served from here.
+  app.use(express.static(path.join(__dirname, "../public"), { index: false }));
+  app.use(express.static(distPath, { index: false }));
 
   const sendIndex = (req, res) => res.sendFile(path.join(distPath, "index.html"));
 
-  app.get("/", sendIndex);
-  app.get("/selg", sendIndex);
-  app.get("/sslg", sendIndex);
-  app.get("/results", sendIndex);
-  app.get("/results/selg", sendIndex);
-  app.get("/results/sslg", sendIndex);
-  app.get("/admin", sendIndex);
+  // The React router is mounted at basename "/election", so serving index.html
+  // at an unprefixed path renders a blank page. Redirect instead of serving.
+  const toElection = (req, res) => res.redirect(302, `/election${req.path === "/" ? "/" : req.path}`);
+
+  app.get("/", toElection);
+  app.get("/selg", toElection);
+  app.get("/sslg", toElection);
+  app.get("/results", toElection);
+  app.get("/results/selg", toElection);
+  app.get("/results/sslg", toElection);
+  app.get("/admin", toElection);
 
   app.get("/election", sendIndex);
   app.get("/election/selg", sendIndex);
@@ -713,13 +981,27 @@ app.use(express.static(distPath));
   app.get("/election/results/sslg", sendIndex);
   app.get("/election/admin", sendIndex);
 
+  // Deep links inside the SPA are served index.html; anything else outside the
+  // /election basename is redirected so it lands on a page that actually renders.
   app.use((req, res, next) => {
-    if (req.method === "GET" && !req.path.startsWith("/api")) {
+    if (req.method !== "GET" || req.path.startsWith("/api")) return next();
+    if (req.path.startsWith("/election")) {
       return res.sendFile(path.join(distPath, "index.html"));
     }
-    next();
+    res.redirect(302, "/election/");
   });
 }
+
+// A rejected cross-origin request should be a clean JSON 403, not Express's
+// default HTML 500 page.
+app.use((err, req, res, next) => {
+  if (err && /CORS policy/.test(err.message || "")) {
+    return res.status(403).json({ error: "Request origin is not permitted." });
+  }
+  if (res.headersSent) return next(err);
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Unexpected server error." });
+});
 
 app.listen(PORT, () => {
   console.log(`MABDC election server running at http://localhost:${PORT}`);

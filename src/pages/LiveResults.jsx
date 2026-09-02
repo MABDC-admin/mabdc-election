@@ -224,16 +224,27 @@ function ProclaimedWinnersView({ positions, electionCode, stats }) {
 }
 
 // PIN Unlock Modal for Winners
-function PinUnlockModal({ onUnlock, onClose }) {
+function PinUnlockModal({ electionCode, onUnlock, onClose }) {
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  function handleSubmit(e) {
+  // The PIN is checked by the server, not compared here: a value embedded in
+  // the bundle is readable by anyone who opens the page source.
+  async function handleSubmit(e) {
     e.preventDefault();
-    if (pin.trim() === "1234" || pin.trim() === "MABDC@2026") {
-      onUnlock();
-    } else {
-      setError("Incorrect PIN. Please try again.");
+    const entered = pin.trim();
+    if (!entered) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.getLiveResults(electionCode, entered);
+      try { sessionStorage.setItem("mabdc_results_pin", entered); } catch {}
+      onUnlock(entered);
+    } catch (err) {
+      setError(err.status === 401 ? "Incorrect PIN. Please try again." : (err.message || "Could not verify the PIN."));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -248,7 +259,7 @@ function PinUnlockModal({ onUnlock, onClose }) {
             type="password"
             autoFocus
             maxLength={10}
-            placeholder="Enter PIN (e.g. 1234)"
+            placeholder="Enter results PIN"
             value={pin}
             onChange={(e) => {
               setPin(e.target.value);
@@ -261,8 +272,8 @@ function PinUnlockModal({ onUnlock, onClose }) {
             <button type="button" className="btn-cancel-modal" onClick={onClose}>
               Cancel
             </button>
-            <button type="submit" className="btn-confirm-modal">
-              Unlock View →
+            <button type="submit" className="btn-confirm-modal" disabled={busy}>
+              {busy ? "Checking…" : "Unlock View →"}
             </button>
           </div>
         </form>
@@ -286,6 +297,7 @@ export default function LiveResults() {
     return sessionStorage.getItem("mabdc_winners_unlocked") === "true";
   });
   const [showPinModal, setShowPinModal] = useState(false);
+  const [locked, setLocked] = useState(false);
 
   async function fetchResults(isSilent = false) {
     if (!isSilent) setLoading(true);
@@ -295,7 +307,14 @@ export default function LiveResults() {
       setLastRefreshed(new Date());
       setError("");
     } catch (err) {
-      if (!isSilent) setError(err.message || "Failed to load live results.");
+      // A locked feed is not an error to shout about - prompt for the PIN.
+      if (err.status === 401 && err.data?.pinRequired) {
+        setLocked(true);
+        setShowPinModal(true);
+        setError("");
+      } else if (!isSilent) {
+        setError(err.message || "Failed to load live results.");
+      }
     } finally {
       if (!isSilent) setLoading(false);
     }
@@ -303,12 +322,13 @@ export default function LiveResults() {
 
   useEffect(() => {
     fetchResults();
+    if (locked) return undefined; // no point polling a feed we cannot read
     const interval = setInterval(() => {
       fetchResults(true);
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [electionCode]);
+  }, [electionCode, locked]);
 
   function switchDivision(code) {
     setElectionCode(code);
@@ -340,6 +360,34 @@ export default function LiveResults() {
       councilPositions: council
     };
   }, [data]);
+
+  // Locked feed: show the PIN prompt instead of an empty scoreboard.
+  if (locked && !data) {
+    return (
+      <div className="live-scoreboard-root">
+        <div className="center-message">
+          <h2 style={{ marginBottom: 8 }}>🔒 Results are locked</h2>
+          <p style={{ marginBottom: 18 }}>
+            Live tallies are hidden while voting is open. Enter the results PIN to view them.
+          </p>
+          <button type="button" className="btn-confirm-modal" onClick={() => setShowPinModal(true)}>
+            Enter results PIN
+          </button>
+        </div>
+        {showPinModal && (
+          <PinUnlockModal
+            electionCode={electionCode}
+            onUnlock={() => {
+              setShowPinModal(false);
+              setLocked(false);
+              fetchResults();
+            }}
+            onClose={() => setShowPinModal(false)}
+          />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="live-scoreboard-root">

@@ -1,11 +1,52 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Link } from "react-router-dom";
-import { api } from "../api.js";
+import { api, resizeImageToDataUri } from "../api.js";
+
+/**
+ * Small camera button that picks an image, downscales it in the browser and
+ * hands back a JPEG data URI. Used for both learner and candidate photos so
+ * the two paths behave identically.
+ */
+function PhotoPickerButton({ onPicked, busy, label = "📷 Photo", title = "Upload photo", className = "row-photo-btn" }) {
+  const inputId = useMemo(() => `photo-input-${Math.random().toString(36).slice(2)}`, []);
+
+  return (
+    <>
+      <input
+        id={inputId}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        style={{ display: "none" }}
+        onChange={async (e) => {
+          const file = e.target.files?.[0];
+          e.target.value = ""; // allow re-picking the same file after a failure
+          if (file) await onPicked(file);
+        }}
+      />
+      <button
+        type="button"
+        className={className}
+        title={title}
+        disabled={busy}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          document.getElementById(inputId)?.click();
+        }}
+      >
+        {busy ? "⏳ …" : label}
+      </button>
+    </>
+  );
+}
 
 function AdminLogin({ onLogin }) {
   const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("MABDC@2026");
+  // Left blank on purpose. A prefilled password ships in the public JS bundle,
+  // and if it does not match the deployed ADMIN_PASSWORD it silently fails every
+  // sign-in attempt. Username stays prefilled since there is only one account.
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -454,7 +495,15 @@ function WinnersProclamationModule({ results, electionCode, stats }) {
 }
 
 
-function UnvotedLearnersModule({ learners = [], electionCode, onRefresh, onViewPassword }) {
+function UnvotedLearnersModule({
+  learners = [],
+  electionCode,
+  onRefresh,
+  onViewPassword,
+  onUploadPhoto,
+  photoBusyId,
+  photoVersion = 0
+}) {
   const [search, setSearch] = useState("");
   const [filterLevel, setFilterLevel] = useState("ALL");
 
@@ -572,8 +621,10 @@ function UnvotedLearnersModule({ learners = [], electionCode, onRefresh, onViewP
                 <tr key={learner.voter_id} className="unvoted-row">
                   <td className="row-num">{idx + 1}</td>
                   <td className="row-photo-cell">
+                    {/* Looked up by voterId: uploaded photos are stored as
+                        <LRN>.jpg, which original_id would not match. */}
                     <img
-                      src={`/api/photos/election_photo.php?id=${learner.original_id || learner.voter_id}`}
+                      src={`/api/photos/election_photo.php?voterId=${encodeURIComponent(learner.voter_id)}&v=${photoVersion}`}
                       alt={learner.name}
                       className="audit-learner-thumb"
                       onError={(e) => {
@@ -605,6 +656,11 @@ function UnvotedLearnersModule({ learners = [], electionCode, onRefresh, onViewP
                       >
                         🔑 Password
                       </button>
+                      <PhotoPickerButton
+                        busy={photoBusyId === `learner-${learner.voter_id}`}
+                        title={`Upload a photo for ${learner.name}`}
+                        onPicked={(file) => onUploadPhoto && onUploadPhoto(learner.voter_id, file)}
+                      />
                     </div>
                   </td>
                 </tr>
@@ -727,12 +783,12 @@ function VoterBallotHistoryModal({ token, voterId, electionCode, onClose }) {
         {loading ? (
           <div className="modal-loading-body">
             <div className="admin-spinner" />
-            <span>Loading voter ballot choices…</span>
+            <span>Loading voter participation record…</span>
           </div>
         ) : error ? (
           <div className="modal-error-body">{error}</div>
         ) : !data ? (
-          <div className="modal-empty-body">No ballot records found.</div>
+          <div className="modal-empty-body">No participation record found.</div>
         ) : (
           <div className="voter-modal-content">
             {/* Clean Single Profile Row */}
@@ -764,28 +820,28 @@ function VoterBallotHistoryModal({ token, voterId, electionCode, onClose }) {
               </div>
             </div>
 
-            {/* Ballot Choices (Clean 2-Column Grid) */}
+            {/* Participation status only. Individual candidate selections are
+                not retrievable by design — see the ballot secrecy note in the
+                README and the /api/admin/voter/:voterId/ballot handler. */}
             <div className="modal-ballot-section">
-              <div className="modal-ballot-clean-grid">
-                {data.ballot?.map((item, idx) => (
-                  <div className="modal-clean-choice-card" key={idx}>
-                    <span className="clean-choice-pos">{item.position_title}</span>
-                    <div className="clean-choice-candidate">
-                      <img
-                        src={item.candidate_photo || `https://api.dicebear.com/9.x/notionists/svg?seed=${encodeURIComponent(item.candidate_name)}`}
-                        alt={item.candidate_name}
-                        className="clean-candidate-thumb"
-                        onError={(e) => {
-                          e.target.src = `https://api.dicebear.com/9.x/notionists/svg?seed=${encodeURIComponent(item.candidate_name)}`;
-                        }}
-                      />
-                      <div className="clean-candidate-meta">
-                        <strong>{item.candidate_name}</strong>
-                        <small>{item.candidate_party}</small>
-                      </div>
-                    </div>
+              <div className="modal-secrecy-panel">
+                <div className="modal-secrecy-status">
+                  <span className="secrecy-icon" aria-hidden="true">🔒</span>
+                  <div>
+                    <strong>
+                      {data.hasVoted ? "Ballot cast and verified" : "No ballot cast yet"}
+                    </strong>
+                    <p>
+                      {data.hasVoted
+                        ? "This learner's participation is recorded. Their candidate selections are stored anonymously and cannot be traced back to them."
+                        : "This learner has not yet submitted a ballot for this election."}
+                    </p>
                   </div>
-                ))}
+                </div>
+                <p className="modal-secrecy-footnote">
+                  Ballot secrecy is enforced at the database level. Use Live Results for
+                  aggregated tallies.
+                </p>
               </div>
             </div>
           </div>
@@ -807,12 +863,31 @@ function VoterBallotHistoryModal({ token, voterId, electionCode, onClose }) {
    OFFICIAL PRINT / PDF REPORT SUITE (4 COMPREHENSIVE PDF DOCUMENTS)
    ========================================================================== */
 
-function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
+function AllPdfReportsContainer({ dashboard, electionCode, printMode, slipGrade = "ALL" }) {
   if (!dashboard) return null;
   const stats = dashboard.stats || { totalEligible: 0, votesCast: 0, turnout: 0, remaining: 0 };
   const results = dashboard.results || [];
   const receipts = dashboard.receipts || [];
   const unvoted = dashboard.unvotedLearners || [];
+
+  // Every registered learner in this division: those who have voted (receipts)
+  // plus those who have not (unvoted). Used for the login-slip sheets.
+  const allLearners = [...receipts, ...unvoted]
+    .reduce((acc, learner) => {
+      if (!acc.some((existing) => existing.voter_id === learner.voter_id)) acc.push(learner);
+      return acc;
+    }, [])
+    .sort((a, b) => (a.level || "").localeCompare(b.level || "") || (a.name || "").localeCompare(b.name || ""));
+
+  // Login slips are printed one grade at a time so each class can be handed its
+  // own stack. "ALL" keeps the whole division in a single run.
+  const gradeNumber = (level) => {
+    const m = String(level || "").match(/(\d+)/);
+    return m ? Number(m[1]) : null;
+  };
+  const slipLearners =
+    slipGrade === "ALL" ? allLearners : allLearners.filter((l) => gradeNumber(l.level) === Number(slipGrade));
+  const slipGradeLabel = slipGrade === "ALL" ? "All grades" : `Grade ${slipGrade}`;
 
   // Group candidates by partylist
   const partylistSummary = {};
@@ -1306,14 +1381,94 @@ function AllPdfReportsContainer({ dashboard, electionCode, printMode }) {
           </div>
         </div>
       )}
+
+      {/* 4. VOTER LOGIN SLIPS — one cut-out slip per learner, for distribution.
+          Each slip carries the learner's own credentials and nothing else, so a
+          slip handed to the wrong learner discloses only that one account. */}
+      {(printMode === "credential_slips") && (
+        <div className="printable-pdf-document credential-slips-doc" id="pdf-credential-slips">
+          <div className="slips-sheet-header">
+            <img src="/mabdc_logo.png" alt="MABDC Logo" className="slips-header-logo" />
+            <div>
+              <h2>MABDC VOTER LOGIN SLIPS</h2>
+              <p>
+                {electionCode === "SELG"
+                  ? "Supreme Elementary Learner Government (SELG) • Grades 4–6"
+                  : "Supreme Secondary Learner Government (SSLG) • Grades 7–12"}
+                {" • "}
+                {slipGradeLabel} • {slipLearners.length} learners • Generated {new Date().toLocaleString()}
+              </p>
+            </div>
+            <div className="slips-confidential-stamp">CONFIDENTIAL</div>
+          </div>
+
+          <p className="slips-handling-note">
+            Cut along the dotted lines and hand each slip to the named learner only.
+            Each slip contains that learner's voting credentials. Collect or destroy
+            any undistributed slips after the election.
+          </p>
+
+          <div className="credential-slips-grid">
+            {slipLearners.map((learner, idx) => (
+              <div className="credential-slip" key={learner.voter_id || idx}>
+                <div className="slip-top">
+                  <img src="/mabdc_logo.png" alt="" className="slip-logo" />
+                  <div className="slip-org">
+                    <strong>M.A. BRAIN DEVELOPMENT CENTER</strong>
+                    <small>{electionCode} Online Election • S.Y. 2026–2027</small>
+                  </div>
+                </div>
+
+                <div className="slip-learner">
+                  <span className="slip-label">LEARNER</span>
+                  <strong className="slip-name">{learner.name}</strong>
+                  <span className="slip-level">{learner.level}</span>
+                </div>
+
+                <div className="slip-creds">
+                  <div className="slip-cred-row">
+                    <span className="slip-label">VOTER ID (LRN)</span>
+                    <code className="slip-value">{learner.voter_id}</code>
+                  </div>
+                  <div className="slip-cred-row">
+                    <span className="slip-label">PASSWORD</span>
+                    <code className="slip-value slip-password">
+                      {learner.password || "— not set —"}
+                    </code>
+                  </div>
+                </div>
+
+                <div className="slip-footer">
+                  <span>Vote at: <strong>{typeof window !== "undefined" ? window.location.origin : ""}/election/{electionCode.toLowerCase()}</strong></span>
+                  <span className="slip-status">
+                    {learner.receipt_code ? "✓ Already voted" : "Not yet voted"}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 function ExportReportModal({ dashboard, electionCode, onClose, onPrintPdf }) {
-  function handlePdfExport(mode) {
-    onPrintPdf(mode);
+  function handlePdfExport(mode, grade) {
+    onPrintPdf(mode, grade);
   }
+
+  // Grades actually present in this division, so SELG shows 4-6 and SSLG 7-12.
+  const slipRoster = [...(dashboard?.receipts || []), ...(dashboard?.unvotedLearners || [])].reduce((acc, l) => {
+    if (!acc.some((x) => x.voter_id === l.voter_id)) acc.push(l);
+    return acc;
+  }, []);
+  const gradeCounts = {};
+  for (const l of slipRoster) {
+    const m = String(l.level || "").match(/(\d+)/);
+    if (m) gradeCounts[Number(m[1])] = (gradeCounts[Number(m[1])] || 0) + 1;
+  }
+  const slipGrades = Object.keys(gradeCounts).map(Number).sort((a, b) => a - b);
 
   function downloadMasterCSV() {
     if (!dashboard) return;
@@ -1508,6 +1663,39 @@ function ExportReportModal({ dashboard, electionCode, onClose, onPrintPdf }) {
                 🖨️ Download Unvoted Roll PDF
               </button>
             </div>
+
+            {/* 5. VOTER LOGIN SLIPS (PDF) */}
+            <div className="report-option-card">
+              <div className="report-card-badge badge-confidential">🔒 CONFIDENTIAL</div>
+              <div className="report-card-icon">🎫</div>
+              <div className="report-card-info">
+                <h4>Voter Login Slips (.PDF)</h4>
+                <p>
+                  Cut-out slip per learner with their Voter ID and password, for handing
+                  out before voting. Pick a grade to print that class only.
+                  Contains credentials — print, distribute, then destroy any spares.
+                </p>
+              </div>
+              {/* One grade at a time: each class adviser gets their own stack,
+                  and a mislaid sheet exposes one class rather than the school. */}
+              <div className="slip-grade-row">
+                {slipGrades.map((g) => (
+                  <button
+                    key={g}
+                    type="button"
+                    className="slip-grade-btn"
+                    onClick={() => handlePdfExport("credential_slips", String(g))}
+                    title={`Print login slips for Grade ${g} only`}
+                  >
+                    G{g}
+                    <small>{gradeCounts[g] || 0}</small>
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="secondary-button full-width" onClick={() => handlePdfExport("credential_slips", "ALL")}>
+                🖨️ All grades in one PDF ({dashboard?.stats?.totalEligible || 0})
+              </button>
+            </div>
           </div>
         </div>
 
@@ -1537,6 +1725,11 @@ export default function AdminPortal() {
   const [toastMessage, setToastMessage] = useState("");
   const [showReportModal, setShowReportModal] = useState(false);
   const [printMode, setPrintMode] = useState("master");
+  const [photoBusyId, setPhotoBusyId] = useState(null);
+  const [slipGrade, setSlipGrade] = useState("ALL");
+  // Uploaded photos keep the same filename, so a counter is appended to image
+  // URLs to force the browser to fetch the replacement.
+  const [photoVersion, setPhotoVersion] = useState(0);
 
   function showToast(msg) {
     setToastMessage(msg);
@@ -1576,29 +1769,38 @@ export default function AdminPortal() {
   }
 
 
+  // Photos are downscaled in the browser before upload: ID photos arrive at
+  // 300-450KB and the voter grid loads hundreds at once.
   async function handleCandidatePhotoUpload(candidateId, file) {
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      const base64 = e.target.result;
-      try {
-        const res = await fetch(`/api/admin/candidates/${candidateId}/photo`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`
-          },
-          body: JSON.stringify({ photo_b64: base64 })
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        alert("✓ Photo uploaded successfully!");
-        loadDashboard(false); // Refresh
-      } catch (err) {
-        alert("Upload failed: " + err.message);
-      }
-    };
-    reader.readAsDataURL(file);
+    setPhotoBusyId(`cand-${candidateId}`);
+    try {
+      const dataUri = await resizeImageToDataUri(file);
+      await api.uploadCandidatePhoto(token, candidateId, dataUri);
+      showToast("✓ Candidate photo updated.");
+      setPhotoVersion((v) => v + 1);
+      loadDashboard(false);
+    } catch (err) {
+      showToast("Upload failed: " + (err.message || "unknown error"));
+    } finally {
+      setPhotoBusyId(null);
+    }
+  }
+
+  async function handleLearnerPhotoUpload(voterId, file) {
+    if (!file) return;
+    setPhotoBusyId(`learner-${voterId}`);
+    try {
+      const dataUri = await resizeImageToDataUri(file);
+      await api.uploadLearnerPhoto(token, voterId, dataUri);
+      showToast("✓ Learner photo updated.");
+      // Bump the cache-buster so the <img> reloads: the filename is unchanged.
+      setPhotoVersion((v) => v + 1);
+    } catch (err) {
+      showToast("Upload failed: " + (err.message || "unknown error"));
+    } finally {
+      setPhotoBusyId(null);
+    }
   }
 
   useEffect(() => {
@@ -1944,8 +2146,10 @@ export default function AdminPortal() {
                       >
                         <td className="row-num">{idx + 1}</td>
                         <td className="row-photo-cell">
+                          {/* Looked up by voterId: uploaded photos are stored as
+                              <LRN>.jpg, which original_id would not match. */}
                           <img
-                            src={`/api/photos/election_photo.php?id=${r.original_id || r.voter_id}`}
+                            src={`/api/photos/election_photo.php?voterId=${encodeURIComponent(r.voter_id)}&v=${photoVersion}`}
                             alt={r.name}
                             className="audit-learner-thumb"
                             onError={(e) => {
@@ -1971,7 +2175,7 @@ export default function AdminPortal() {
                             <button
                               className="row-inspect-btn"
                               onClick={() => setSelectedVoterId(r.voter_id)}
-                              title="Inspect learner's full cast ballot"
+                              title="View learner's participation record and receipt"
                             >
                               👁️ View Ballot
                             </button>
@@ -1987,6 +2191,11 @@ export default function AdminPortal() {
                             >
                               🔑 Password
                             </button>
+                            <PhotoPickerButton
+                              busy={photoBusyId === `learner-${r.voter_id}`}
+                              title={`Upload a photo for ${r.name}`}
+                              onPicked={(file) => handleLearnerPhotoUpload(r.voter_id, file)}
+                            />
                             <button
                               className="row-reset-btn"
                               onClick={() => setResettingVoter(r)}
@@ -2016,6 +2225,9 @@ export default function AdminPortal() {
               electionCode={electionCode}
               onRefresh={() => loadDashboard(false)}
               onViewPassword={setViewingPasswordVoter}
+              onUploadPhoto={handleLearnerPhotoUpload}
+              photoBusyId={photoBusyId}
+              photoVersion={photoVersion}
             />
           )}
         </main>
@@ -2056,6 +2268,7 @@ export default function AdminPortal() {
           dashboard={dashboard}
           electionCode={electionCode}
           printMode={printMode}
+          slipGrade={slipGrade}
         />
       )}
 
@@ -2064,8 +2277,9 @@ export default function AdminPortal() {
           dashboard={dashboard}
           electionCode={electionCode}
           onClose={() => setShowReportModal(false)}
-          onPrintPdf={(mode) => {
+          onPrintPdf={(mode, grade = "ALL") => {
             setPrintMode(mode);
+            setSlipGrade(grade);
             setTimeout(() => {
               window.print();
             }, 150);

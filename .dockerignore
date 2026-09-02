@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.gitignore
+
+# Secrets must never be baked into an image layer. JWT_SECRET and the admin
+# password are supplied at runtime via docker-compose env_file instead.
+.env
+.env.*
+!.env.example
+
+# The live election database is a mounted volume, not image content.
+server/data
+public/photos
+
+*.md
